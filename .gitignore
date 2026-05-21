@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Environment secrets
+.env
+
+# Docker
+pgdata/
+catalog-engine/mongodb-data/
+catalog-engine/meilisearch-data/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Uploaded images (dev)
+catalog-engine/catalog-media/*
+
+# Logs
+*.log
