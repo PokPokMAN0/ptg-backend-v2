@@ -68,6 +68,7 @@ All exposed through a clean, documented REST API.
 ---
 
 ## 🏗️ Architecture
+```
 ┌─────────────────────────────────────────────────────┐
 │ CLIENT LAYER │
 │ ┌──────────────┐ ┌──────────┐ ┌──────────────┐ │
@@ -103,6 +104,7 @@ The **Main Core** owns all sensitive operational data.
 They are linked via `CatalogRef` – a lightweight PostgreSQL table that caches product IDs, names, and prices for fast SQL joins and reporting.
 
 ---
+```
 
 ## 🔐 Security at Its Core
 
