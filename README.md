@@ -70,38 +70,40 @@ All exposed through a clean, documented REST API.
 ## 🏗️ Architecture
 ```
 ┌─────────────────────────────────────────────────────┐
-│ CLIENT LAYER │
-│ ┌──────────────┐ ┌──────────┐ ┌──────────────┐ │
-│ │Web Storefront│ │ POS UI │ │Admin Dashboard│ │
-│ │ (Next.js) │ │(Next.js) │ │ (Next.js) │ │
-│ └──────┬───────┘ └────┬─────┘ └──────┬───────┘ │
-│ │ │ │ │
-└─────────┼───────────────┼───────────────┼──────────┘
-│ │ │
-└───────────────┼───────────────┘
-│
-┌────────────────▼────────────────┐
-│ API GATEWAY │
-│ Fastify + JWT + RBAC + Rate Lim │
-└────────────────┬────────────────┘
-│
-┌───────────────────┼───────────────────┐
-│ │ │
-▼ ▼ ▼
-┌───────────┐ ┌──────────────────┐ ┌────────────┐
-│ Express │ │ Fastify (Core) │ │ Meilisearch│
-│ (Catalog) │ │ │ │ (Search) │
-└─────┬─────┘ └────────┬──────────┘ └──────┬──────┘
-│ │ │
-▼ ▼ ▼
-┌───────────┐ ┌──────────────────┐ ┌──────────────┐
-│ MongoDB │ │ PostgreSQL │ │ Meilisearch │
-│ (Catalog) │ │ (Users,Sales,etc)│ │ (Index) │
-└───────────┘ └──────────────────┘ └──────────────┘
+│                   CLIENT LAYER                      │
+│  ┌──────────────┐  ┌──────────┐  ┌───────────────┐  │
+│  │Web Storefront│  │ POS UI   │  │Admin Dashboard│  │
+│  │ (Next.js)    │  │(Next.js) │  │ (Next.js)     │  │
+│  └──────┬───────┘  └────┬─────┘  └──────┬────────┘  │
+│         │               │               │           │
+└─────────┼───────────────┼───────────────┼───────────┘
+          │               │               │
+          └───────────────┼───────────────┘
+                          │
+         ┌────────────────▼────────────────┐
+         │ API GATEWAY                     │
+         │ Fastify + JWT + RBAC + Rate Lim │
+         └────────────────┬────────────────┘
+                          │
+      ┌───────────────────┼───────────────────┐
+      │                   │                   │
+      ▼                   ▼                   ▼
+   ┌───────────┐ ┌──────────────────┐ ┌─────────────┐
+   │ Express   │ │ Fastify (Core)   │ │ Meilisearch │
+   │ (Catalog) │ │                  │ │ (Search)    │
+   └─────┬─────┘ └────────┬─────────┘ └──────┬──────┘
+         │                │                  │
+         ▼                ▼                  ▼
+   ┌───────────┐ ┌──────────────────┐ ┌──────────────┐
+   │ MongoDB   │ │ PostgreSQL       │ │ Meilisearch  │
+   │ (Catalog) │ │ (Users,Sales,etc)│ │ (Index)      │
+   └───────────┘ └──────────────────┘ └──────────────┘
 
 The **Catalog Engine** owns the public product data.  
 The **Main Core** owns all sensitive operational data.  
-They are linked via `CatalogRef` – a lightweight PostgreSQL table that caches product IDs, names, and prices for fast SQL joins and reporting.
+They are linked via `CatalogRef` – a lightweight
+PostgreSQL table that caches product IDs, names, and
+prices for fast SQL joins and reporting.
 
 ---
 ```
