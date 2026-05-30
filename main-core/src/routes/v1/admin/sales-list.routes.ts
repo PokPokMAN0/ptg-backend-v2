@@ -84,9 +84,10 @@ async function salesListHandler(
               imei_2: true,
               serial_number: true,
               dealer_cost: true,
-              retail_mrp: true,
               status: true,
-              catalog_ref: { select: { name: true, sku: true } },
+              catalog_ref: {
+                select: { name: true, sku: true, retail_mrp: true },
+              },
             },
           },
         },
@@ -114,6 +115,7 @@ async function salesListHandler(
         serial_number: item.inventory_unit.serial_number
           ? decryptField(item.inventory_unit.serial_number)
           : null,
+        retail_mrp: item.inventory_unit.catalog_ref?.retail_mrp,
       },
     })),
   }));

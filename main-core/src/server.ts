@@ -3,7 +3,9 @@
 // =============================================================================
 
 // 1. Load environment variables BEFORE any other module touches process.env
-import { config } from "./config";
+import dotenv from "dotenv";
+dotenv.config();
+
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import fjwt from "@fastify/jwt";
@@ -11,10 +13,20 @@ import rateLimit from "@fastify/rate-limit";
 import { PrismaClient } from "./lib/prisma";
 import { PrismaPg } from "@prisma/adapter-pg";
 import fastifyHelmet from "@fastify/helmet";
+import fastifyStatic from "@fastify/static";
+import fastifyMultipart from "@fastify/multipart";
+import fastifyCookie from "@fastify/cookie";
+import fastifyCompress from "@fastify/compress";
+import fastifySwagger from "@fastify/swagger";
+import fastifySwaggerUi from "@fastify/swagger-ui";
+import { join } from "node:path";
+
 import { authRoutes } from "./routes/v1/auth/auth.routes";
 import { catalogSyncRoutes } from "./routes/v1/admin/catalog-sync.routes";
 import { inventoryRoutes } from "./routes/v1/admin/inventory.routes";
 import { posSalesRoutes } from "./routes/v1/pos/sales.routes";
+import { posLookupRoutes } from "./routes/v1/pos/lookup.routes";
+import { posSearchInventoryRoutes } from "./routes/v1/pos/search-inventory.routes";
 import { reportRoutes } from "./routes/v1/admin/reports.routes";
 import { salesListRoutes } from "./routes/v1/admin/sales-list.routes";
 import { productManageRoutes } from "./routes/v1/admin/product-manage.routes";
@@ -27,14 +39,10 @@ import { customerOrderRoutes } from "./routes/v1/customer/orders.routes";
 import { webOrderRoutes } from "./routes/v1/checkout/web-order.routes";
 import { userManagementRoutes } from "./routes/v1/admin/users.routes";
 import { customerAccountRoutes } from "./routes/v1/customer/account.routes";
-import { posLookupRoutes } from "./routes/v1/pos/lookup.routes";
-import { posSearchInventoryRoutes } from "./routes/v1/pos/search-inventory.routes";
-import fastifySwagger from "@fastify/swagger";
-import fastifySwaggerUi from "@fastify/swagger-ui";
-import { logger } from "./lib/logger";
+import { customerPhotoRoutes } from "./routes/v1/customer/photo.routes";
 
 // ---------------------------------------------------------------------------
-// Environment guard – fail fast if critical vars are missing
+// Environment guard
 // ---------------------------------------------------------------------------
 const requiredEnvVars = [
   "DATABASE_URL",
@@ -45,8 +53,8 @@ const requiredEnvVars = [
 ] as const;
 
 for (const key of requiredEnvVars) {
-  if (!config[key]) {
-    logger.error(`[server] Missing required environment variable: ${key}`);
+  if (!process.env[key]) {
+    console.error(`[server] Missing required environment variable: ${key}`);
     process.exit(1);
   }
 }
@@ -55,7 +63,7 @@ for (const key of requiredEnvVars) {
 // Prisma 7 adapter + client
 // ---------------------------------------------------------------------------
 const adapter = new PrismaPg({
-  connectionString: config.DATABASE_URL!,
+  connectionString: process.env.DATABASE_URL!,
 });
 
 const prisma = new PrismaClient({ adapter });
@@ -65,12 +73,23 @@ const prisma = new PrismaClient({ adapter });
 // ---------------------------------------------------------------------------
 const server = Fastify({
   logger: {
-    level: config.LOG_LEVEL ?? "info",
+    level: process.env.LOG_LEVEL ?? "info",
     transport:
-      config.NODE_ENV === "development"
+      process.env.NODE_ENV === "development"
         ? { target: "pino-pretty", options: { colorize: true } }
         : undefined,
   },
+  bodyLimit: 10 * 1024 * 1024,
+});
+
+// Increase default body limit (before multipart can handle it)
+server.addHook("onRoute", (routeOptions) => {
+  if (routeOptions.url === "/v1/customer/account/photo") {
+    (routeOptions as any).config = {
+      ...((routeOptions as any).config || {}),
+      bodyLimit: 10 * 1024 * 1024, // 10 MB
+    };
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -78,22 +97,23 @@ const server = Fastify({
 // ---------------------------------------------------------------------------
 server.decorate("prisma", prisma);
 
-// Global error handler – prevents raw Prisma errors from reaching the client
+// Global error handler
 server.setErrorHandler((error, request, reply) => {
   server.log.error(error);
-
-  // Type‑narrow: treat as a generic Error for common properties
   const err = error instanceof Error ? error : new Error(String(error));
 
-  // Prisma known request errors
   if (err.name === "PrismaClientKnownRequestError") {
     return reply.status(400).send({
       success: false,
       error: "Invalid request. Check your input data.",
     });
   }
-
-  // Fastify validation errors (they have a validation property)
+  if (err.message === "Request body is too large") {
+    return reply.status(413).send({
+      success: false,
+      error: "File is too large. Maximum size is 10 MB.",
+    });
+  }
   if ("validation" in err) {
     return reply.status(400).send({
       success: false,
@@ -101,7 +121,6 @@ server.setErrorHandler((error, request, reply) => {
     });
   }
 
-  // Default internal error
   return reply.status(500).send({
     success: false,
     error: "Internal server error. Please try again later.",
@@ -109,18 +128,27 @@ server.setErrorHandler((error, request, reply) => {
 });
 
 // ---------------------------------------------------------------------------
-// Main startup wrapper (CommonJS safe – no top‑level await)
+// Main startup
 // ---------------------------------------------------------------------------
 async function main() {
-  // ---- Plugins ----
-  await server.register(cors, {
-    origin: config.CORS_ORIGIN?.split(",") ?? ["http://localhost:3000"],
-    credentials: true,
+  // ---- Compression ----
+  await server.register(fastifyCompress, {
+    encodings: ["br", "gzip"],
   });
 
+  // ---- CORS ----
+  await server.register(cors, {
+    origin: ["http://localhost:3000"],
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
+    preflightContinue: false,
+  });
+
+  // ---- Security headers ----
   await server.register(fastifyHelmet);
 
-  // Swagger documentation – must be registered BEFORE routes
+  // ---- Swagger ----
   await server.register(fastifySwagger, {
     openapi: {
       info: {
@@ -150,37 +178,47 @@ async function main() {
   await server.register(fastifySwaggerUi, {
     routePrefix: "/docs",
     uiConfig: {
-      docExpansion: "list", // collapse all endpoints by default
+      docExpansion: "list",
       deepLinking: true,
     },
   });
 
-  // Rate limiting (global off, applied per‑route)
+  // ---- Rate limiting ----
   await server.register(rateLimit, { global: false });
 
-  // JWT authentication
+  // ---- JWT ----
   await server.register(fjwt, {
-    secret: config.JWT_SECRET!,
-    sign: { expiresIn: "7d" }, // extended for development
+    secret: process.env.JWT_SECRET!,
+    sign: { expiresIn: "7d" },
   });
 
-  // Enable cookie parsing (for refresh tokens)
-  await server.register(require("@fastify/cookie"));
+  // ---- Cookies ----
+  await server.register(fastifyCookie);
 
-  // Register auth routes
+  // ---- Multipart (before routes that need it) ----
+  await server.register(fastifyMultipart, {
+    limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+  });
+
+  // ---- Static serving for profile pics ----
+  await server.register(fastifyStatic, {
+    root: join(__dirname, "..", "public", "profile-pics"),
+    prefix: "/profile-pics/",
+    setHeaders: (res) => {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+    },
+  });
+
+  // ---- All routes ----
   await server.register(authRoutes);
-
   await server.register(catalogSyncRoutes);
-
   await server.register(inventoryRoutes);
-
   await server.register(posSalesRoutes);
   await server.register(posLookupRoutes);
   await server.register(posSearchInventoryRoutes);
-
   await server.register(reportRoutes);
   await server.register(salesListRoutes);
-
   await server.register(productManageRoutes);
   await server.register(supplierRoutes);
   await server.register(batchRoutes);
@@ -190,44 +228,78 @@ async function main() {
   await server.register(customerOrderRoutes);
   await server.register(webOrderRoutes);
   await server.register(customerAccountRoutes);
-
+  await server.register(customerPhotoRoutes);
   await server.register(userManagementRoutes);
 
-  // ---- Health check ----
+  // ---- Enhanced Health Check ----
   server.get("/health", async () => {
+    const checks: {
+      service: string;
+      status: "OK" | "Minor Error" | "Critical Error";
+      detail: string;
+    }[] = [];
+
     // PostgreSQL
-    const dbStatus = await prisma.$queryRaw`SELECT 1`
-      .then(() => "connected")
-      .catch(() => "disconnected");
+    try {
+      const start = Date.now();
+      await prisma.$queryRaw`SELECT 1`;
+      const ms = Date.now() - start;
+      checks.push({ service: "PostgreSQL", status: "OK", detail: `${ms}ms` });
+    } catch (err: any) {
+      checks.push({
+        service: "PostgreSQL",
+        status: "Critical Error",
+        detail: err.message || "Disconnected",
+      });
+    }
 
     // Catalog Engine
-    let catalogStatus = "unknown";
     try {
       const catalogUrl =
         process.env.CATALOG_ENGINE_URL || "http://localhost:4000";
       const res = await fetch(`${catalogUrl}/health`);
-      const body = await res.json();
-      catalogStatus = body.status === "ok" ? "healthy" : "unhealthy";
-    } catch {
-      catalogStatus = "unreachable";
+      if (res.ok) {
+        const body = await res.json();
+        checks.push({
+          service: "Catalog Engine",
+          status: body.status === "ok" ? "OK" : "Minor Error",
+          detail: body.status || "Unknown",
+        });
+      } else {
+        checks.push({
+          service: "Catalog Engine",
+          status: "Minor Error",
+          detail: `HTTP ${res.status}`,
+        });
+      }
+    } catch (err: any) {
+      checks.push({
+        service: "Catalog Engine",
+        status: "Critical Error",
+        detail: err.message || "Unreachable",
+      });
     }
 
+    // Overall status
+    const hasCritical = checks.some((c) => c.status === "Critical Error");
+    const hasMinor = checks.some((c) => c.status === "Minor Error");
+    const overall = hasCritical
+      ? "Critical Error"
+      : hasMinor
+        ? "Minor Error"
+        : "OK";
+
     return {
-      status: dbStatus === "connected" ? "ok" : "degraded",
+      status: overall,
       uptime: process.uptime(),
       timestamp: new Date().toISOString(),
-      db: dbStatus,
-      catalog_engine: catalogStatus,
+      checks,
     };
   });
-  // ---- TODO: Register route plugins here ----
-  // await server.register(authRoutes, { prefix: "/v1/auth" });
-  // await server.register(adminRoutes, { prefix: "/v1/admin" });
-  // await server.register(posRoutes, { prefix: "/v1/pos" });
 
-  // ---- Start listening ----
+  // ---- Start ----
   const PORT = parseInt(process.env.PORT ?? "8080", 10);
-  const HOST = config.HOST ?? "0.0.0.0";
+  const HOST = process.env.HOST ?? "0.0.0.0";
 
   try {
     await server.listen({ port: PORT, host: HOST });
@@ -251,11 +323,10 @@ async function shutdown(signal: string) {
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-// Kick off
 main();
 
 // ---------------------------------------------------------------------------
-// Type augmentation – make `server.prisma` available in all routes
+// Type augmentation
 // ---------------------------------------------------------------------------
 declare module "fastify" {
   interface FastifyInstance {

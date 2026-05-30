@@ -14,6 +14,12 @@ const {
 } = require("../search-engine/meilisearch");
 
 const rateLimit = require("express-rate-limit");
+const {
+  cacheGet,
+  cacheSet,
+  cacheDel,
+  cacheDelPattern,
+} = require("../lib/redis");
 
 const searchLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
@@ -127,24 +133,91 @@ function deleteImageFile(productId) {
 }
 
 function setupRoutes(app) {
-  // ── Health Check ──
+  // ── Enhanced Health Check ──
   app.get("/health", async (req, res) => {
+    const checks = [];
+
+    // MongoDB
     try {
       await db.getAllProducts(); // simplest DB call
-      const searchOk = await index
-        .getStats()
-        .then(() => true)
-        .catch(() => false);
-      res.json({
-        status: "ok",
-        db: "connected",
-        search: searchOk ? "connected" : "disconnected",
+      checks.push({ service: "MongoDB", status: "OK", detail: "Connected" });
+    } catch (err) {
+      checks.push({
+        service: "MongoDB",
+        status: "Critical Error",
+        detail: err.message,
+      });
+    }
+
+    // Meilisearch
+    try {
+      const stats = await index.getStats();
+      checks.push({
+        service: "Meilisearch",
+        status: "OK",
+        detail: `${stats.numberOfDocuments} docs`,
       });
     } catch (err) {
-      res
-        .status(500)
-        .json({ status: "error", db: "disconnected", search: "unknown" });
+      checks.push({
+        service: "Meilisearch",
+        status: "Critical Error",
+        detail: err.message,
+      });
     }
+
+    // Redis (if available — non‑critical)
+    try {
+      let redis;
+      try {
+        redis = require("./lib/redis");
+      } catch {
+        try {
+          redis = require("../lib/redis");
+        } catch {
+          redis = null;
+        }
+      }
+      if (redis) {
+        await redis.cacheSet("health-check", "ok", 10);
+        const val = await redis.cacheGet("health-check");
+        if (val === "ok") {
+          checks.push({ service: "Redis", status: "OK", detail: "Connected" });
+        } else {
+          checks.push({
+            service: "Redis",
+            status: "Minor Error",
+            detail: "Read-back failed",
+          });
+        }
+      } else {
+        checks.push({
+          service: "Redis",
+          status: "Minor Error",
+          detail: "Module not found — caching disabled",
+        });
+      }
+    } catch (err) {
+      checks.push({
+        service: "Redis",
+        status: "Minor Error",
+        detail: err.message || "Unavailable",
+      });
+    }
+
+    const hasCritical = checks.some((c) => c.status === "Critical Error");
+    const hasMinor = checks.some((c) => c.status === "Minor Error");
+    const overall = hasCritical
+      ? "Critical Error"
+      : hasMinor
+        ? "Minor Error"
+        : "OK";
+
+    res.json({
+      status: overall,
+      uptime: process.uptime(),
+      timestamp: new Date().toISOString(),
+      checks,
+    });
   });
   // ========================================================================
   // CREATE – POST /api/products (multipart with optional image)
@@ -177,6 +250,8 @@ function setupRoutes(app) {
         // ✅ Auto-sync to Main Core (non‑blocking) – moved here
         autoSync(product._id.toString(), product).catch(() => {});
 
+        await cacheDelPattern("search:*");
+
         res.status(201).json(product);
       } catch (err) {
         if (req.file && fs.existsSync(req.file.path)) {
@@ -199,9 +274,26 @@ function setupRoutes(app) {
   // READ one – GET /api/products/:id
   // ========================================================================
   app.get("/api/products/:id", async (req, res) => {
-    const product = await db.getProductById(req.params.id);
-    if (!product) return res.status(404).json({ error: "Not found" });
-    res.json(product);
+    try {
+      const cacheKey = `product:${req.params.id}`;
+      const cached = await cacheGet(cacheKey);
+      if (cached) {
+        return res.json({ success: true, data: cached, cached: true });
+      }
+
+      const product = await db.getProductById(req.params.id);
+      if (!product) return res.status(404).json({ error: "Not found" });
+
+      await cacheSet(
+        cacheKey,
+        product.toObject ? product.toObject() : product,
+        300,
+      ); // 5 min TTL
+
+      res.json(product);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
   // ========================================================================
@@ -235,6 +327,10 @@ function setupRoutes(app) {
         // ✅ Auto-sync (already correct, but keep after sync)
         autoSync(req.params.id, product).catch(() => {});
 
+        // Invalidate caches
+        await cacheDel(`product:${req.params.id}`);
+        await cacheDelPattern("search:*"); // clear all search caches
+
         res.json(product);
       } catch (err) {
         if (req.file && fs.existsSync(req.file.path)) {
@@ -264,36 +360,55 @@ function setupRoutes(app) {
       sku: "",
     }).catch(() => {});
 
+    // Invalidate caches
+    await cacheDel(`product:${req.params.id}`);
+    await cacheDelPattern("search:*"); // clear all search caches
+
     res.json({ message: "Deleted" });
   });
 
   // ========================================================================
   // SEARCH – GET /api/search?q=...&limit=20&page=1&brand=Apple
   // ========================================================================
-  app.get("/api/search", searchLimiter, async (req, res) => {
-    const { q = "", limit, page, ...filters } = req.query;
-
-    // If the query looks like a MongoDB ObjectId (24 hex chars), search by exact id
-    const isObjectId = /^[a-fA-F0-9]{24}$/.test(q);
-
+  app.get("/api/search", async (req, res) => {
     try {
-      let result;
-      if (isObjectId) {
-        // Direct ID lookup via filter – instant and precise
-        result = await searchProducts("", {
-          limit: parseInt(limit) || 20,
-          page: parseInt(page) || 1,
-          filters: { ...filters, id: q },
-        });
-      } else {
-        // Normal full‑text search
-        result = await searchProducts(q, {
-          limit: parseInt(limit) || 20,
-          page: parseInt(page) || 1,
-          filters,
-        });
+      const { q = "", limit, page, ...filters } = req.query;
+
+      // Build a deterministic cache key from the full query
+      const cacheKey = `search:${JSON.stringify({ q, limit, page, filters })}`;
+      const cached = await cacheGet(cacheKey);
+      if (cached) {
+        return res.json({ ...cached, cached: true });
       }
-      res.json(result);
+
+      const filterArray = [];
+      for (const [key, value] of Object.entries(filters)) {
+        filterArray.push(`${key} = "${value}"`);
+      }
+      filterArray.push("metadata.is_active = true");
+
+      const resultLimit = parseInt(limit) || 20;
+      const currentPage = parseInt(page) || 1;
+      const offset = (currentPage - 1) * resultLimit;
+
+      const results = await index.search(q, {
+        filter: filterArray.join(" AND "),
+        limit: resultLimit,
+        offset,
+      });
+
+      const response = {
+        query: q,
+        page: currentPage,
+        limit: resultLimit,
+        totalHits: results.estimatedTotalHits,
+        totalPages: Math.ceil(results.estimatedTotalHits / resultLimit),
+        hits: results.hits,
+      };
+
+      await cacheSet(cacheKey, response, 120); // 2 min TTL for search
+
+      res.json(response);
     } catch (err) {
       res.status(500).json({ error: err.message });
     }

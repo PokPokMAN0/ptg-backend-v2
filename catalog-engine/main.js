@@ -17,7 +17,10 @@ const app = express();
 app.use(express.json());
 const helmet = require("helmet");
 const cors = require("cors");
+const compression = require("compression");
+
 app.use(helmet());
+app.use(compression());
 app.use(cors({ origin: process.env.CORS_ORIGIN || "http://localhost:3000" }));
 // Global error handler
 app.use((err, req, res, next) => {
